@@ -1,0 +1,816 @@
+
+===== CELL 3 (code) =====
+class StandardEncoder(nn.Module):
+    def __init__(self, input_dim, latent_dim, hidden_dim=512):
+        super(StandardEncoder, self).__init__()
+        self.part1 = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+        )
+        self.to_mean = nn.Linear(hidden_dim, latent_dim)
+        self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.latent_dim = latent_dim
+
+    def forward(self, x):
+        x = self.part1(x)
+        return self.to_mean(x), self.to_logvar(x)
+
+
+class StandardDecoder(nn.Module):
+    def __init__(self, input_dim, latent_dim, hidden_dim=512, no_final_relu=False):
+        super(StandardDecoder, self).__init__()
+        if no_final_relu:
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, input_dim),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, input_dim),
+                nn.ReLU(),
+            )
+        self.latent_dim = latent_dim
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Discriminator(nn.Module):
+    def __init__(self, latent_dim, spectral=True, end_dim=2):
+        super(Discriminator, self).__init__()
+        if spectral:
+            self.net = nn.Sequential(
+                nn.utils.spectral_norm(nn.Linear(latent_dim, 1 << 6)),
+                nn.ReLU(),
+                nn.utils.spectral_norm(nn.Linear(1 << 6, 1 << 5)),
+                nn.ReLU(),
+                nn.utils.spectral_norm(nn.Linear(1 << 5, 1 << 5)),
+                nn.ReLU(),
+                nn.utils.spectral_norm(nn.Linear(1 << 5, end_dim)),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim, 1 << 6),
+                nn.ReLU(),
+                nn.Linear(1 << 6, 1 << 5),
+                nn.ReLU(),
+                nn.Linear(1 << 5, 1 << 5),
+                nn.ReLU(),
+                nn.Linear(1 << 5, end_dim),
+            )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class VAE(nn.Module):
+    def __init__(self, encoder, decoder, is_vae=True, use_latent_norm=True):
+        super(VAE, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.is_vae = is_vae
+        self.latent_normalizer = nn.BatchNorm1d(self.encoder.latent_dim)
+        self.use_latent_norm = use_latent_norm
+
+    def reparam_trick(self, mean, logvar):
+        # VAE: sample; AE: deterministic (return mean)
+        if not self.is_vae:
+            return mean
+        sigma = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(sigma)
+        return mean + eps * sigma
+
+    def get_latent(self, x):
+        mean, logvar = self.encoder(x)
+
+        # ✅ AE 模式：logvar 不参与任何 BN（避免污染 running stats）
+        if not self.is_vae:
+            latent = mean
+            if self.use_latent_norm:
+                latent = self.latent_normalizer(latent)
+            return latent
+
+        # ✅ VAE 模式：按你原来的思路（可选择是否也 BN logvar）
+        if self.use_latent_norm:
+            mean = self.latent_normalizer(mean)
+            # 这行可留可不留；保守起见我不对 logvar 用同一个 BN
+            # logvar = self.latent_normalizer(logvar)
+        latent = self.reparam_trick(mean, logvar)
+        if self.use_latent_norm:
+            latent = self.latent_normalizer(latent)
+        return latent
+
+    def forward(self, x, noise_latent_lambda=0.0):
+        mean, logvar = self.encoder(x)
+
+        if not self.is_vae:
+            latent = mean
+            if self.use_latent_norm:
+                latent = self.latent_normalizer(latent)
+        else:
+            if self.use_latent_norm:
+                mean = self.latent_normalizer(mean)
+                # 同上：通常不建议用同一个 BN 去处理 logvar
+                # logvar = self.latent_normalizer(logvar)
+            latent = self.reparam_trick(mean, logvar)
+            if self.use_latent_norm:
+                latent = self.latent_normalizer(latent)
+
+        if noise_latent_lambda:
+            latent = latent + noise_latent_lambda * torch.randn_like(latent)
+
+        recon_x = self.decoder(latent)
+        return recon_x, mean, logvar, latent
+
+
+===== CELL 4 (code) =====
+def old_vae_loss(x, recon_x, mean, logvar, weights=None, this_lambda=0.0):
+    if weights is None:
+        bce = F.mse_loss(recon_x, x)
+    else:
+        bce = torch.sum(((recon_x - x) ** 2) * weights)
+    kl_div = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+    return bce + this_lambda * kl_div
+
+
+def discrim_loss(pred, true):
+    return F.binary_cross_entropy_with_logits(pred, true)
+
+
+def adv_vae_loss(x, recon_x, mean, logvar, discrim_preds, alpha, beta, weights=None):
+    vae_part_loss = old_vae_loss(x, recon_x, mean, logvar, weights=weights)
+    source_label = [1.0, 0.0]
+    discrim_labels = torch.tensor([source_label] * x.shape[0]).to(x.device)
+    total_discrim_loss = F.binary_cross_entropy_with_logits(discrim_preds, discrim_labels)
+    discrim_part_loss = beta * total_discrim_loss
+    return alpha * vae_part_loss + discrim_part_loss, vae_part_loss, total_discrim_loss
+
+
+===== CELL 8 (code) =====
+# ==== MODIFIED (2026-03-19) ====
+# Purpose: Disable latent BN in ref_vae (use_latent_norm=False) and keep corrected epoch loss averaging.
+# ===============================
+epochs_ref_vae = 10
+input_dim = train_data.shape[1]
+
+ref_vae = VAE(
+    StandardEncoder(input_dim, 1 << 7, hidden_dim=1 << 11),
+    StandardDecoder(input_dim, 1 << 7, hidden_dim=1 << 11),
+    is_vae=False,
+    use_latent_norm=False,
+).to(device)
+
+ref_vae_opt = optim.Adam(ref_vae.parameters(), lr=1e-3)
+
+ref_vae_losses = []
+for epoch in range(1, epochs_ref_vae + 1):
+    epoch_loss = 0.0
+    seen = 0
+    for _id, (batch, labels) in enumerate(train_loader):
+        batch = batch.to(device)
+        ref_vae_opt.zero_grad()
+        recon_x, mean, logvar, latent = ref_vae(batch)
+        batch_loss = old_vae_loss(batch, recon_x, mean, logvar, weights=None)
+        batch_loss.backward()
+        ref_vae_opt.step()
+        bs = batch.size(0)
+        epoch_loss += batch_loss.item() * bs
+        seen += bs
+    avg_loss = epoch_loss / max(seen, 1)
+    ref_vae_losses.append(avg_loss)
+    print(f"RefVAE Epoch {epoch}: avg_loss={avg_loss:.6f}")
+
+
+===== CELL 10 (code) =====
+# ==== FIXED (2026-03-19) ====
+# Device-safe tensor/model placement to avoid CPU/GPU mismatch.
+ref_vae_eval = ref_vae.to(device).eval()
+with torch.no_grad():
+    train_tensor_dev = torch.tensor(train_data, dtype=torch.float32, device=get_model_device(ref_vae_eval))
+    test_tensor_dev = torch.tensor(test_data, dtype=torch.float32, device=get_model_device(ref_vae_eval))
+    _, _, _, latent_train = ref_vae_eval(train_tensor_dev)
+    _, _, _, latent_test = ref_vae_eval(test_tensor_dev)
+
+latent_train = latent_train.detach().cpu()
+latent_test = latent_test.detach().cpu()
+
+latent_dim = 1 << 7
+num_classes = len(np.unique(train_labels))
+
+celltype_classifier = Discriminator(latent_dim, end_dim=num_classes).to(device)
+celltype_classifier_opt = optim.Adam(celltype_classifier.parameters(), lr=1e-3)
+
+class_weights = torch.tensor([
+    float(len(train_labels)) / np.sum(train_labels == class_label)
+    for class_label in range(num_classes)
+], dtype=torch.float32).to(device)
+criter = nn.CrossEntropyLoss(weight=class_weights)
+
+celltype_data_loader = DataLoader(
+    TensorDataset(latent_train, torch.tensor(train_labels, dtype=torch.long)),
+    batch_size=batch_size,
+    shuffle=True,
+)
+
+classifier_loss_history = []
+classifier_acc_history = []
+
+epochs_classifier = 50
+for epoch in range(1, epochs_classifier + 1):
+    epoch_loss = 0.0
+    correct = 0
+    total = 0
+    for this_batch, this_label in celltype_data_loader:
+        this_batch = this_batch.to(device)
+        this_label = this_label.to(device)
+        celltype_classifier_opt.zero_grad()
+        logits = celltype_classifier(this_batch.float())
+        loss = criter(logits, this_label)
+        loss.backward()
+        celltype_classifier_opt.step()
+        epoch_loss += loss.item()
+        preds = torch.argmax(logits, dim=1)
+        correct += (preds == this_label).sum().item()
+        total += this_label.size(0)
+    avg_loss = epoch_loss / len(celltype_data_loader.dataset)
+    acc = correct / total
+    classifier_loss_history.append(avg_loss)
+    classifier_acc_history.append(acc)
+    print(f"Classifier Epoch {epoch}: avg_loss={avg_loss:.6f}, acc={acc:.4f}")
+
+
+===== CELL 14 (code) =====
+# ==== FIXED (2026-03-19) ====
+# Device-safe tensor/model placement to avoid CPU/GPU mismatch.
+# Validation 1: Cross-validated ROC on single-cell latent (to reduce optimistic split effects)
+from sklearn.model_selection import StratifiedKFold
+
+ref_vae_eval = ref_vae.to(device).eval()
+with torch.no_grad():
+    all_tensor_dev = torch.tensor(train_feature, dtype=torch.float32, device=get_model_device(ref_vae_eval))
+    _, _, _, latent_all = ref_vae_eval(all_tensor_dev)
+
+X_latent = latent_all.detach().cpu().numpy()
+y_all = labels_encoded
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+cv_aucs = []
+
+for fold, (tr, te) in enumerate(skf.split(X_latent, y_all), 1):
+    clf = Discriminator(latent_dim, end_dim=len(classes)).to(device)
+    opt = optim.Adam(clf.parameters(), lr=1e-3)
+    weights = torch.tensor([
+        float(len(tr)) / np.sum(y_all[tr] == k) for k in range(len(classes))
+    ], dtype=torch.float32).to(device)
+    loss_fn = nn.CrossEntropyLoss(weight=weights)
+
+    ds = TensorDataset(
+        torch.tensor(X_latent[tr], dtype=torch.float32),
+        torch.tensor(y_all[tr], dtype=torch.long),
+    )
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    # short training (keep it light)
+    for _ in range(15):
+        for xb, yb in dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            opt.zero_grad()
+            logits = clf(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            opt.step()
+
+    clf = clf.to("cpu")
+    with torch.no_grad():
+        logits = clf(torch.tensor(X_latent[te], dtype=torch.float32, device=get_model_device(clf)))
+        probs = torch.softmax(logits, dim=1).numpy()
+
+    # macro AUC for the fold
+    y_bin = label_binarize(y_all[te], classes=list(range(len(classes))))
+    fold_aucs = []
+    for i in range(len(classes)):
+        fpr, tpr, _ = roc_curve(y_bin[:, i], probs[:, i])
+        fold_aucs.append(auc(fpr, tpr))
+    cv_aucs.append(np.mean(fold_aucs))
+    print(f"Fold {fold}: macro AUC = {cv_aucs[-1]:.4f}")
+
+print(f"CV macro AUC (mean ± std): {np.mean(cv_aucs):.4f} ± {np.std(cv_aucs):.4f}")
+
+===== CELL 16 (code) =====
+# ==== MODIFIED (2026-03-19) ====
+# Latent-only training (recon + adv + celltype),
+# with non-truncating loader pairing (cycle ref loader instead of zip truncation).
+latent_dim = 1 << 7
+ref_vae = ref_vae.to(device).eval()
+
+input_cell_dim = raman_X.shape[1]
+raman_vae = VAE(
+    StandardEncoder(input_cell_dim, latent_dim, hidden_dim=1 << 11),
+    StandardDecoder(input_cell_dim, latent_dim, hidden_dim=1 << 11, no_final_relu=True),
+    is_vae=False,
+    use_latent_norm=False,
+).to(device)
+raman_opt = optim.Adam(raman_vae.parameters(), lr=5e-5)
+
+raman_discrim = Discriminator(latent_dim).to(device)
+raman_discrim_opt = optim.Adam(raman_discrim.parameters(), lr=4e-3)
+
+# Keep latent-only objective and original alpha
+alpha = 1.0
+beta = 1e-2         # tuned up from 3e-4 to make adversarial signal non-trivial
+raman_beta = 20.0   # reduced from 50 to reduce over-dominant celltype term
+
+celltype_classifier = celltype_classifier.to(device).eval()
+for p in celltype_classifier.parameters():
+    p.requires_grad = False
+
+ref_data_loader = DataLoader(
+    TensorDataset(torch.from_numpy(train_feature).float()),
+    batch_size=batch_size,
+    shuffle=True,
+)
+
+epochs_raman = 50
+loss_adv = []
+loss_vae = []
+loss_celltype = []
+loss_discrim = []
+domain_acc_epoch = []
+
+for epoch in range(1, epochs_raman + 1):
+    discrim_epoch_loss = 0.0
+    vae_part_epoch_loss = 0.0
+    raman_vae_epoch_loss = 0.0
+    celltype_part_epoch_loss = 0.0
+    seen = 0
+
+    ref_iter = iter(ref_data_loader)
+    for _id, (raman_batch, raman_celltypes) in enumerate(raman_train_loader):
+        try:
+            (ref_batch,) = next(ref_iter)
+        except StopIteration:
+            ref_iter = iter(ref_data_loader)
+            (ref_batch,) = next(ref_iter)
+
+        raman_opt.zero_grad()
+        raman_discrim_opt.zero_grad()
+
+        ref_batch = ref_batch.to(device)
+        raman_batch = raman_batch.to(device)
+        raman_celltypes = raman_celltypes.to(device)
+        bs = raman_batch.size(0)
+
+        # Step A: train domain discriminator
+        ref_encoded = ref_vae.get_latent(ref_batch).detach()
+        raman_encoded = raman_vae.get_latent(raman_batch).detach()
+
+        source_label, target_label = [1.0, 0.0], [0.0, 1.0]
+        encodeds = torch.cat((ref_encoded, raman_encoded), axis=0)
+        discrim_labels = torch.tensor(
+            [source_label] * ref_encoded.shape[0] + [target_label] * raman_encoded.shape[0],
+            device=device,
+        )
+
+        pred_discrim_labels = raman_discrim(encodeds)
+        batch_discrim_loss = discrim_loss(pred_discrim_labels, discrim_labels)
+        batch_discrim_loss.backward()
+        discrim_epoch_loss += batch_discrim_loss.item() * bs
+        raman_discrim_opt.step()
+
+        # Step B: train Raman VAE (freeze discriminator)
+        for param in raman_discrim.parameters():
+            param.requires_grad = False
+
+        recon_raman_batch, raman_batch_mean, raman_batch_logvar, raman_batch_latent = raman_vae(raman_batch)
+        raman_vae_discrim_preds = raman_discrim(raman_batch_latent)
+
+        raman_vae_batch_loss, vae_part_batch_loss, _ = adv_vae_loss(
+            raman_batch.detach(),
+            recon_raman_batch,
+            raman_batch_mean,
+            raman_batch_logvar,
+            raman_vae_discrim_preds,
+            alpha,
+            beta,
+        )
+
+        raman_celltype_preds = celltype_classifier(raman_batch_latent)
+        raman_celltype_loss = criter(raman_celltype_preds, raman_celltypes)
+        raman_vae_batch_loss = raman_vae_batch_loss + raman_beta * raman_celltype_loss
+
+        raman_vae_batch_loss.backward()
+        celltype_part_epoch_loss += raman_celltype_loss.item() * bs
+        raman_vae_epoch_loss += raman_vae_batch_loss.item() * bs
+        vae_part_epoch_loss += vae_part_batch_loss.item() * bs
+        seen += bs
+        raman_opt.step()
+
+        for param in raman_discrim.parameters():
+            param.requires_grad = True
+
+    # Epoch averages
+    loss_adv.append(raman_vae_epoch_loss / max(seen, 1))
+    loss_vae.append(vae_part_epoch_loss / max(seen, 1))
+    loss_celltype.append(celltype_part_epoch_loss / max(seen, 1))
+    loss_discrim.append(discrim_epoch_loss / max(seen, 1))
+
+    # Domain discriminator accuracy (full data snapshot)
+    with torch.no_grad():
+        z_ref_all = ref_vae.get_latent(torch.from_numpy(train_feature).float().to(device))
+        z_ram_all = raman_vae.get_latent(torch.from_numpy(raman_X).float().to(device))
+        z_all = torch.cat([z_ref_all, z_ram_all], dim=0)
+        logits_all = raman_discrim(z_all)
+        pred_all = torch.argmax(logits_all, dim=1).cpu().numpy()
+        y_all = np.array([0] * z_ref_all.shape[0] + [1] * z_ram_all.shape[0])
+        dacc = float((pred_all == y_all).mean())
+        domain_acc_epoch.append(dacc)
+
+    print(
+        f"Raman Epoch {epoch}: adv={loss_adv[-1]:.6f}, vae={loss_vae[-1]:.6f}, "
+        f"celltype={loss_celltype[-1]:.6f}, discrim={loss_discrim[-1]:.6f}, dacc={domain_acc_epoch[-1]:.4f}"
+    )
+
+
+===== CELL 18 (code) =====
+# ==== FIXED (2026-03-19) ====
+# Device-safe tensor/model placement to avoid CPU/GPU mismatch.
+# ===== Domain discriminator accuracy (should approach 0.5 if aligned) =====
+ref_vae = ref_vae.to(device).eval()
+raman_vae = raman_vae.to(device).eval()
+raman_discrim = raman_discrim.to(device).eval()
+
+with torch.no_grad():
+    z_ref = ref_vae.get_latent(torch.from_numpy(train_feature).float().to(get_model_device(ref_vae)))
+    z_ram = raman_vae.get_latent(torch.from_numpy(raman_X).float().to(get_model_device(raman_vae)))
+    z = torch.cat([z_ref, z_ram], dim=0)
+    logits = raman_discrim(z.to(get_model_device(raman_discrim)))
+    pred = torch.argmax(logits, dim=1).cpu().numpy()
+
+y = np.array([0]*z_ref.shape[0] + [1]*z_ram.shape[0])
+acc = (pred == y).mean()
+print("Domain discrim acc:", acc)
+
+===== CELL 20 (code) =====
+# ==== FIXED (2026-03-19) ====
+# cuda-safe numpy conversion for AnnData construction.
+# =========================
+# FIXED inference: use trained latent BN and eval mode
+# =========================
+ref_vae = ref_vae.to(device).eval()
+raman_vae = raman_vae.to(device).eval()
+celltype_classifier = celltype_classifier.to(device).eval()  # optional
+
+with torch.no_grad():
+    # 1) SingleCell -> (optional) recon by ref_vae (for comparison)
+    orig_sc = torch.from_numpy(train_feature).float().to(device)
+    recon_singlecell, _, _, z_sc = ref_vae(orig_sc)
+
+    # 2) Raman train/test -> latent by raman_vae.get_latent (trained BN!) -> decode by ref decoder
+    orig_rt = torch.from_numpy(raman_X_train).float().to(device)
+    z_rt = raman_vae.get_latent(orig_rt)              # ✅ trained latent normalizer
+    recon_raman_train = ref_vae.decoder(z_rt)         # ✅ decode in ref expression space
+
+    orig_rv = torch.from_numpy(raman_X_test).float().to(device)
+    z_rv = raman_vae.get_latent(orig_rv)
+    recon_raman_test = ref_vae.decoder(z_rv)
+
+# build AnnData (same as you did)
+recon_adata_singlecell = sc.AnnData(recon_singlecell.detach().cpu().numpy())
+recon_adata_singlecell.obs = train_feature_ad.obs.copy()
+recon_adata_singlecell.var_names = train_feature_ad.var_names
+recon_adata_singlecell.obs["batch"] = "SingleCell"
+
+recon_adata_raman_train = sc.AnnData(recon_raman_train.detach().cpu().numpy())
+recon_adata_raman_train.obs = raman_ad.obs.loc[raman_index_train].copy()
+recon_adata_raman_train.var_names = train_feature_ad.var_names
+recon_adata_raman_train.obs["batch"] = "Raman_Train"
+
+recon_adata_raman_test = sc.AnnData(recon_raman_test.detach().cpu().numpy())
+recon_adata_raman_test.obs = raman_ad.obs.loc[raman_index_test].copy()
+recon_adata_raman_test.var_names = train_feature_ad.var_names
+recon_adata_raman_test.obs["batch"] = "Raman_Test"
+
+# categorical order
+for ad_ in [recon_adata_singlecell, recon_adata_raman_train, recon_adata_raman_test]:
+    ad_.obs["cell_type"] = pd.Categorical(ad_.obs["cell_type"], categories=classes, ordered=True)
+
+together_recon = recon_adata_singlecell.concatenate(
+    recon_adata_raman_train,
+    recon_adata_raman_test,
+    batch_key=None,
+)
+
+# PCA/UMAP
+sc.pp.pca(together_recon, n_comps=30)
+sc.pp.neighbors(together_recon, n_neighbors=30)
+sc.tl.umap(together_recon)
+
+fig = sc.pl.umap(together_recon, color=["batch"], return_fig=True)
+save_figure(fig, "umap_batch_fixed_inference")
+
+===== CELL 21 (code) =====
+# ==== FIXED (2026-03-19) ====
+# Device-safe tensor/model placement to avoid CPU/GPU mismatch.
+# =========================
+# UMAP on latent (alignment target space)
+# =========================
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import torch
+
+ref_vae = ref_vae.to(device).eval()
+raman_vae = raman_vae.to(device).eval()
+
+with torch.no_grad():
+    z_sc = ref_vae.get_latent(torch.from_numpy(train_feature).float().to(get_model_device(ref_vae)))
+    z_rt = raman_vae.get_latent(torch.from_numpy(raman_X_train).float().to(get_model_device(raman_vae)))
+    z_rv = raman_vae.get_latent(torch.from_numpy(raman_X_test).float().to(get_model_device(raman_vae)))
+
+Z = np.vstack([z_sc.detach().cpu().numpy(), z_rt.detach().cpu().numpy(), z_rv.detach().cpu().numpy()])
+
+# =========================
+# 构建 obs
+# =========================
+obs = pd.DataFrame(index=
+    list(train_feature_ad.obs_names)
+    + list(raman_index_train)
+    + list(raman_index_test)
+)
+
+# batch
+obs["batch"] = (
+    ["SingleCell"] * z_sc.shape[0]
+    + ["Raman_Train"] * z_rt.shape[0]
+    + ["Raman_Test"] * z_rv.shape[0]
+)
+
+# cell_type（注意索引对齐）
+obs["cell_type"] = (
+    list(train_feature_ad.obs["cell_type"].values)
+    + list(raman_ad.obs.loc[raman_index_train, "cell_type"].values)
+    + list(raman_ad.obs.loc[raman_index_test, "cell_type"].values)
+)
+
+# 如果你希望类别顺序一致
+obs["cell_type"] = pd.Categorical(
+    obs["cell_type"],
+    categories=classes,
+    ordered=True
+)
+
+# =========================
+# 构建 AnnData
+# =========================
+latent_adata = sc.AnnData(Z, obs=obs)
+
+# 不需要 PCA，latent 已经是低维
+sc.pp.neighbors(latent_adata, n_neighbors=30, metric="cosine")
+sc.tl.umap(latent_adata)
+
+# =========================
+# 画图
+# =========================
+fig = sc.pl.umap(
+    latent_adata,
+    color=["batch", "cell_type"],
+    wspace=0.4,
+    return_fig=True
+)
+
+save_figure(fig, "umap_latent_batch_celltype")
+
+===== CELL 22 (code) =====
+# ==== FIXED (2026-03-19) ====
+# Device-safe tensor/model placement to avoid CPU/GPU mismatch.
+# ==== MODIFIED (2026-03-19) ====
+# Purpose: Use use_latent_norm=False in transfer_vae to match training config.
+# ===============================
+# =========================
+# Part B1: get inferred expression from Raman via transfer_vae
+# =========================
+import numpy as np
+import torch
+import scanpy as sc
+import scipy as sp
+
+transfer_vae = VAE(
+    raman_vae.encoder,
+    ref_vae.decoder,
+    is_vae=False,
+    use_latent_norm=False,
+).to(device).eval()
+
+ref_vae = ref_vae.to(device).eval()
+
+with torch.no_grad():
+    inferred_rt, _, _, latent_rt = transfer_vae(torch.from_numpy(raman_X_train).float().to(get_model_device(transfer_vae)))
+    inferred_rv, _, _, latent_rv = transfer_vae(torch.from_numpy(raman_X_test).float().to(get_model_device(transfer_vae)))
+
+inferred_rt = inferred_rt.detach().cpu().numpy()
+inferred_rv = inferred_rv.detach().cpu().numpy()
+
+# 对齐基因名（就是 HVGs）
+gene_names = np.array(train_feature_ad.var_names)
+
+===== CELL 29 (code) =====
+# ==== FIXED (2026-03-19) ====
+# Device-safe tensor/model placement to avoid CPU/GPU mismatch.
+# ======================================================
+# Raman->SC ROC + Accuracy Table (like the provided figure)
+# ======================================================
+# Use transfer_vae to map Raman to SC space, then use SC classifier
+transfer_vae_eval = transfer_vae.to(device).eval()
+ref_vae_eval = ref_vae.to(device).eval()
+celltype_classifier_eval = celltype_classifier.to(device).eval()
+
+with torch.no_grad():
+    raman_recon, _, _, _ = transfer_vae_eval(torch.tensor(raman_X, dtype=torch.float32, device=get_model_device(transfer_vae_eval)))
+    _, _, _, latent_raman2sc = ref_vae_eval(raman_recon.to(get_model_device(ref_vae_eval)))
+    logits = celltype_classifier_eval(latent_raman2sc.to(get_model_device(celltype_classifier_eval)))
+    probs = torch.softmax(logits, dim=1).cpu().numpy()
+
+raman_labels = raman_y
+pred = np.argmax(probs, axis=1)
+
+# Build table
+rows = []
+for i, ct in enumerate(classes):
+    idx = raman_labels == i
+    members = int(idx.sum())
+    correct = int((pred[idx] == i).sum())
+    acc = 100.0 * correct / max(members, 1)
+    counts = [int(((pred[idx] == j).sum())) for j in range(len(classes))]
+    rows.append([ct, members, f"{acc:.2f}%"] + counts)
+
+total_members = len(raman_labels)
+correct_total = int((pred == raman_labels).sum())
+acc_total = 100.0 * correct_total / max(total_members, 1)
+counts_total = [int((pred == j).sum()) for j in range(len(classes))]
+rows.append(["Total", total_members, f"{acc_total:.2f}%"] + counts_total)
+
+cols = ["True", "Members", "Correct"] + list(classes)
+acc_table = pd.DataFrame(rows, columns=cols)
+acc_table
+
+
+===== CELL 30 (code) =====
+# ==== FIXED (2026-03-19) ====
+# Device-safe tensor/model placement to avoid CPU/GPU mismatch.
+# Validation 2: Compare classifier ROC on Raman->SC reconstructed vs true SC
+# (if the ROC degrades on Raman->SC, that indicates a domain gap)
+
+# Build latent for Raman->SC data (through transfer_vae + ref encoder)
+transfer_vae_eval = transfer_vae.to(device).eval()
+ref_vae_eval = ref_vae.to(device).eval()
+
+with torch.no_grad():
+    # Raman->SC reconstruction, then encode with ref_vae encoder for classifier
+    raman_recon, _, _, _ = transfer_vae_eval(torch.tensor(raman_X, dtype=torch.float32, device=get_model_device(transfer_vae_eval)))
+    _, _, _, latent_raman2sc = ref_vae_eval(raman_recon.to(get_model_device(ref_vae_eval)))
+
+latent_raman2sc_np = latent_raman2sc.detach().cpu().numpy()
+raman_labels = raman_y
+
+# Use the already trained classifier (celltype_classifier) to score Raman->SC
+celltype_classifier_eval = celltype_classifier.to(device).eval()
+with torch.no_grad():
+    logits = celltype_classifier_eval(latent_raman2sc.to(get_model_device(celltype_classifier_eval)).float())
+    probs = torch.softmax(logits, dim=1).cpu().numpy()
+
+fig, ax = plt.subplots(figsize=(6, 5))
+y_bin = label_binarize(raman_labels, classes=list(range(len(classes))))
+for i, cls in enumerate(classes):
+    fpr, tpr, _ = roc_curve(y_bin[:, i], probs[:, i])
+    roc_auc = auc(fpr, tpr)
+    ax.plot(fpr, tpr, lw=2, label=f"{cls} (AUC={roc_auc:.3f})")
+ax.plot([0, 1], [0, 1], "k--", lw=1)
+ax.set_title("ROC on Raman->SC (using SC classifier)")
+ax.set_xlabel("False Positive Rate")
+ax.set_ylabel("True Positive Rate")
+ax.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
+save_figure(fig, "classifier_roc_raman2sc")
+
+
+===== CELL 37 (code) =====
+# ==== NEW (2026-03-19) ====
+# Unified evaluation + small tuning grid for latent-only setup.
+import sklearn.neighbors as skn
+
+def evaluate_alignment_metrics(ref_vae, raman_vae, raman_discrim, device):
+    ref_vae = ref_vae.to(device).eval()
+    raman_vae = raman_vae.to(device).eval()
+    raman_discrim = raman_discrim.to(device).eval()
+
+    with torch.no_grad():
+        z_ref = ref_vae.get_latent(torch.from_numpy(train_feature).float().to(device))
+        z_ram = raman_vae.get_latent(torch.from_numpy(raman_X).float().to(device))
+        z = torch.cat([z_ref, z_ram], dim=0)
+        pred = torch.argmax(raman_discrim(z), dim=1).cpu().numpy()
+    y = np.array([0] * z_ref.shape[0] + [1] * z_ram.shape[0])
+    domain_acc = float((pred == y).mean())
+
+    # expression-space reconstruction and UMAP mixing
+    with torch.no_grad():
+        recon_sc, _, _, _ = ref_vae(torch.from_numpy(train_feature).float().to(device))
+        z_rt = raman_vae.get_latent(torch.from_numpy(raman_X_train).float().to(device))
+        z_rv = raman_vae.get_latent(torch.from_numpy(raman_X_test).float().to(device))
+        recon_rt = ref_vae.decoder(z_rt)
+        recon_rv = ref_vae.decoder(z_rv)
+
+    ad_sc = sc.AnnData(recon_sc.detach().cpu().numpy())
+    ad_sc.obs = train_feature_ad.obs.copy()
+    ad_sc.var_names = train_feature_ad.var_names
+    ad_sc.obs['batch'] = 'SingleCell'
+
+    ad_rt = sc.AnnData(recon_rt.detach().cpu().numpy())
+    ad_rt.obs = raman_ad.obs.loc[raman_index_train].copy()
+    ad_rt.var_names = train_feature_ad.var_names
+    ad_rt.obs['batch'] = 'Raman_Train'
+
+    ad_rv = sc.AnnData(recon_rv.detach().cpu().numpy())
+    ad_rv.obs = raman_ad.obs.loc[raman_index_test].copy()
+    ad_rv.var_names = train_feature_ad.var_names
+    ad_rv.obs['batch'] = 'Raman_Test'
+
+    together = ad_sc.concatenate(ad_rt, ad_rv, batch_key=None)
+    sc.pp.pca(together, n_comps=30)
+    sc.pp.neighbors(together, n_neighbors=30)
+    sc.tl.umap(together)
+
+    umap = together.obsm['X_umap']
+    labels_batch = together.obs['batch'].values
+    nbrs = skn.NearestNeighbors(n_neighbors=31).fit(umap)
+    _, idxs = nbrs.kneighbors(umap)
+    idxs = idxs[:, 1:]
+    mix_scores = []
+    for i in range(umap.shape[0]):
+        neighbors = labels_batch[idxs[i]]
+        mix_scores.append(np.mean(neighbors != labels_batch[i]))
+    umap_mixing = float(np.mean(mix_scores))
+
+    X_truth = ensure_dense(train_feature_ad.layers['data']).astype(np.float32)
+    X_rt = recon_rt.detach().cpu().numpy().astype(np.float32)
+    X_rv = recon_rv.detach().cpu().numpy().astype(np.float32)
+    orig_sum = X_truth.sum(axis=0) / (X_truth.sum() + 1e-12)
+    corr_train = float(np.corrcoef(orig_sum, X_rt.sum(axis=0) / (X_rt.sum() + 1e-12))[0, 1])
+    corr_test = float(np.corrcoef(orig_sum, X_rv.sum(axis=0) / (X_rv.sum() + 1e-12))[0, 1])
+
+    return {
+        'domain_acc': domain_acc,
+        'umap_mixing_k30': umap_mixing,
+        'pb_corr_train': corr_train,
+        'pb_corr_test': corr_test,
+    }
+
+metrics_now = evaluate_alignment_metrics(ref_vae, raman_vae, raman_discrim, device)
+print('Current metrics:', metrics_now)
+
+# Small grid around adversarial/celltype balance (latent-only)
+# Uncomment to run tuning loop:
+# grid = [(1e-3, 10.0), (1e-2, 10.0), (1e-2, 20.0), (5e-2, 20.0)]
+# print('Suggested grid (beta, raman_beta):', grid)
+
